@@ -1,0 +1,161 @@
+---
+title: "ChIPseq_240503"
+author: "Andrea"
+date: "2024/05/13"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/240503_VH01624_94_AACGY3CHV/ProjectFolders/Project_Shellaina-Gordon/
+project directory: /dawson_genomics/Projects/HBO1/ChIP_240503/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/240503_VH01624_94_AACGY3CHV/ProjectFolders/Project_Shellaina-Gordon/Sample*/*_R1_001.fastq.gz
+do
+sname=`basename $fq _R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/alignHg38BDGP6.sbatch $fq ${dname}/${sname}_R2_001.fastq.gz
+done
+```
+
+# run fastq screen to check for contamination
+```{bash}
+# only need to screen 1 read from each sample
+for fq in /pipeline/Runs/NextSeq/240503_VH01624_94_AACGY3CHV/ProjectFolders/Project_Shellaina-Gordon/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/fastq_screen.sbatch $fq 
+done
+
+module load multiqc/1.8
+multiqc -ip .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+for bam in alignment/*MLL*R1*[0-9].sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Mix-Input-R1-D_S62.sort.rmdup.bam
+done
+
+for bam in alignment/*MLL*R2*[0-9].sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Mix-Input-R2-D_S63.sort.rmdup.bam
+done
+
+for bam in alignment/*MENIN*R1*[0-9].sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Mix-Input-R1_S59.sort.rmdup.bam
+done
+
+for bam in alignment/*MENIN*R2*[0-9].sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Mix-Input-R2_S60.sort.rmdup.bam
+done
+
+for bam in alignment/*-H*R1*[0-9].sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Mix-Input-R1_S59.sort.rmdup.bam
+done
+
+for bam in alignment/*-H*R2*[0-9].sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Mix-Input-R2_S60.sort.rmdup.bam
+done
+```
+
+# make bigwigs and heatmap of all genes for each mark in all conditions
+```{bash}
+mkdir bigwigs
+mkdir results
+mkdir plots
+
+for bam in alignment/*[0-9].sort.rmdup.bam
+do
+sbatch scripts/DeeptoolsBamCov.sbatch $bam
+done
+
+sbatch scripts/DTMatrix_H3K14_MANE_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_H3K23_MANE_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_H3K79_MANE_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_H4K12_MANE_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MENIN_MANE_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MLL-C_MANE_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MLL-N_MANE_RPGCnorm.sbatch
+```
+
+# look at spike-in norm to see if it will correct for differences between reps
+# get bam stats for spike in 
+```{bash}
+module load samtools/1.9
+
+# only histones have spike-in
+for bam in alignment/*-H[34]*_Dm.sort.rmdup.bam
+do
+echo $bam >> alignment/DmBamFlagstat.txt
+samtools flagstat $bam >> alignment/DmBamFlagstat.txt
+done
+```
+
+# Load R libraries and set paths
+```{r}
+library(data.table)
+
+project.dir <- "/dawson_genomics/Projects/HBO1/ChIP_240503"
+align.dir <- file.path(project.dir, "alignment")
+peaks.dir <- file.path(project.dir, "macs/broadpeaks")
+```
+
+# collate DM counts, use lib sizes to get scale factor for bigwigs
+```{r}
+dm.stat <- read.table(file.path(align.dir, "DmBamFlagstat.txt"), header = FALSE, fill = TRUE)
+dm.files <- dm.stat[grep("Dm.sort.rmdup.bam",dm.stat$V1), 1]
+dm.reads <- dm.stat[grep("total", t(dm.stat$V5)), 1]
+
+# make text file with bam names and scale factors to use for deeptools
+# scale factor for each is 10000000/Dm reads
+bam.sf <- cbind(gsub("_Dm.sort.rmdup.bam", ".sort.rmdup.bam", dm.files), 10000000/as.numeric(dm.reads))
+write.table(
+  bam.sf,
+  file.path(align.dir, "bam_sf.txt"),
+  sep = ":",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make bigwigs norm by spike-in
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DmBamCov.sbatch $bam $sf
+done < alignment/bam_sf.txt
+```
+
+# make deeptools plots for H2BK16ac using spike-in bigwigs
+```{bash}
+sbatch scripts/DTMatrix_H3K14_MANE_Dmnorm.sbatch
+sbatch scripts/DTMatrix_H3K23_MANE_Dmnorm.sbatch
+sbatch scripts/DTMatrix_H3K79_MANE_Dmnorm.sbatch
+sbatch scripts/DTMatrix_H4K12_MANE_Dmnorm.sbatch
+```
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_ChIPseq_240503.txt"))
+)
+```
