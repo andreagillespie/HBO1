@@ -1,0 +1,171 @@
+---
+title: "ChIPseq_240207"
+author: "Andrea"
+date: "2024/02/14"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/240207_VH01624_69_AACFWM3HV/ProjectFolders/Project_Shellaina-Gordon/
+project directory: /dawson_genomics/Projects/HBO1/ChIP_240207/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/240207_VH01624_69_AACFWM3HV/ProjectFolders/Project_Shellaina-Gordon/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+sbatch scripts/macs2.sbatch alignment/Combo-MENIN_S4.sort.rmdup.bam alignment/Combo-input_S7.sort.rmdup.bam
+sbatch scripts/macs2.sbatch alignment/Combo-MLL_S3.sort.rmdup.bam alignment/Combo-input_S7.sort.rmdup.bam
+sbatch scripts/macs2.sbatch alignment/Veh-MENIN_S2.sort.rmdup.bam alignment/Veh-input_S6.sort.rmdup.bam
+sbatch scripts/macs2.sbatch alignment/Veh-MLL_S1.sort.rmdup.bam alignment/Veh-input_S6.sort.rmdup.bam
+```
+
+# make bigwigs and heatmap of all peaks for each mark treatment and vehicle
+```{bash}
+for bam in alignment/*sort.rmdup.bam
+do
+sbatch scripts/DeeptoolsBamCov.sbatch $bam
+done
+
+sbatch scripts/DTMatrix_MLL_allPeaks_refpoint.sbatch
+sbatch scripts/DTMatrix_MENIN_allPeaks_refpoint.sbatch
+
+# v few peaks in MENIN, look at it over MLL peaks (combo & veh)
+sbatch scripts/DTMatrix_MLL_MENIN_bothPeaks_refpoint.sbatch
+```
+
+# get diff peaks for MLL combo v veh
+```{bash}
+dname=macs/broadpeaks
+
+sbatch scripts/bdgdiff.sbatch ${dname}/Combo-MLL_S3_treat_pileup.bdg ${dname}/Combo-MLL_S3_control_lambda.bdg ${dname}/Veh-MLL_S1_treat_pileup.bdg ${dname}/Veh-MLL_S1_control_lambda.bdg COMBOvVEH_MLL
+```
+
+# make heatmaps for diff peaks
+```{bash}
+sbatch scripts/DTMatrix_MLL_MENIN_diffPeaks_refpoint.sbatch
+```
+
+# set up R env
+```{r}
+library(data.table)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+project.dir <- file.path("/dawson_genomics/Projects/HBO1/ChIP_240207")
+peak.dir <- file.path(project.dir, "macs/broadpeaks")
+res.dir <- file.path(project.dir, "results")
+plots.dir <- file.path(project.dir, "plots")
+diff.dir <- file.path(project.dir, "bdgdiff")
+```
+
+# annotate peak calls and write out
+```{r}
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+peak.files <- list.files(peak.dir, pattern = "_peaks.broadPeak", full.names = TRUE)
+
+peak.ann <- list()
+for(peak.i in 1:length(peak.files)){
+  peak.file <- fread(peak.files[peak.i])
+  peak.gr <- with(peak.file, GRanges(V1, IRanges(start = V2, end = V3)))
+	seqlevelsStyle(peak.gr) <- "UCSC"
+	anno.peak <- annotatePeak(peak.gr, TxDb = txdb, annoDb = "org.Hs.eg.db")
+	peak.ann[[peak.i]] <- as.data.frame(anno.peak)
+	
+	write.table(
+	  peak.ann[[peak.i]],
+	  file.path(res.dir, paste0(gsub("_S[1-4]_peaks.broadPeak", "", basename(peak.files[[peak.i]])), "_peak_ann.txt")),
+	  sep = "\t",
+	  col.names = TRUE,
+	  row.names = FALSE,
+	  quote = FALSE
+	)
+}
+names(peak.ann) <- gsub("_S[1-4]_peaks.broadPeak", "", basename(peak.files))
+```
+
+# also annotate diff peak calls and make annobar plots
+```{r}
+diff.files <- list.files(diff.dir, pattern = "_c3.0_cond[12].bed", full.names = TRUE)
+
+diff.ann <- list()
+anno.diff.list <- list()
+diff.names <- c("COMBOup", "VEHup")
+for(diff.i in 1:length(diff.files)){
+  diff.file <- fread(diff.files[diff.i], skip = 1)
+  diff.gr <- with(diff.file, GRanges(V1, IRanges(start = V2, end = V3)))
+	seqlevelsStyle(diff.gr) <- "UCSC"
+	anno.diff.list[[diff.i]] <- annotatePeak(diff.gr, TxDb = txdb, annoDb = "org.Hs.eg.db")
+	diff.ann[[diff.i]] <- as.data.frame(anno.diff)
+	
+	write.table(
+	  diff.ann[[diff.i]],
+	  file.path(res.dir, paste0("COMBOvVEH_MLL_diffPeaks_", diff.names[diff.i], "_diffPeaks_ann.txt")),
+	  sep = "\t",
+	  col.names = TRUE,
+	  row.names = FALSE,
+	  quote = FALSE
+	)
+}
+names(diff.ann) <- paste0(gsub("c3.0_cond[12].bed", "", basename(diff.files)), diff.names)
+
+pdf(file.path(plots.dir, "COMBOvVEH_MLL_diffPeaks.pdf"), width = 6, height = 3)
+plotAnnoBar(anno.diff.list[[1]], title = "Combo up")
+plotAnnoBar(anno.diff.list[[2]], title = "Vehicle up")
+dev.off()
+```
+
+# make DT compatible bed file from downreg gene list provided by Shez and make heatmaps
+```{r}
+ref.dir <- file.path(project.dir, "reference_files")
+
+dt.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38EnsGeneDT.bed")
+down.genes <- scan(file.path(ref.dir, "Downreg_gene_RNA_seq.txt"), what = character())
+
+down.bed <- subset(dt.bed, V4 %in% down.genes)
+write.table(
+  down.bed,
+  file.path(ref.dir, "RNAseq_downGenes_DT.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# submit heatmap job
+```{bash}
+# TSS ref point plots
+sbatch scripts/DTMatrix_MLL_MENIN_downGenes_refpoint.sbatch
+
+# also make gene region plot
+sbatch scripts/DTMatrix_MLL_MENIN_downGenes_geneRegion.sbatch
+```
+
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_ChIPseq_240207.txt"))
+)
+```
