@@ -1,0 +1,234 @@
+---
+title: "ChIPseq_250114"
+author: "Andrea"
+date: "2025/01/16"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/250114_VH01624_232_AACN2KKHV/ProjectFolders/Project_Shellaina-Gordon/
+project directory: /dawson_genomics/Projects/HBO1/ChIP_250114
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+mkdir fastq_screen
+
+for fq in /pipeline/Runs/NextSeq/250114_VH01624_232_AACN2KKHV/ProjectFolders/Project_Shellaina-Gordon/*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq 
+done
+
+module load multiqc/1.24.1
+multiqc .
+```
+
+# peak calling (both narrow and broad) include bedgraph output 
+```{bash}
+mkdir -p macs/narrowpeaks
+mkdir -p macs/broadpeaks
+
+for bam in alignment/*[oXHP]-MLL*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Mix-Input-DXL-for-MLL_S14.sort.rmdup.bam
+done
+
+for bam in alignment/*[oXHP]-Menin*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Mix-Input-SXL-for-Menin_S13.sort.rmdup.bam
+done
+```
+
+# make heatmaps & profile plots for mane genes as prev experiment
+```{bash}
+mkdir bigwigs
+mkdir results
+mkdir plots
+
+for bam in alignment/*sort.rmdup.bam
+do
+sbatch scripts/DeeptoolsBamCov.sbatch $bam
+done
+
+sbatch scripts/DTMatrix_MENIN_MANE_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MLL_MANE_RPGCnorm.sbatch
+```
+
+# make bed files of genes lists of interest to make more heatmaps
+# set up env
+```{r}
+library(data.table)
+
+project.dir <- "/dawson_genomics/Projects/HBO1/ChIP_250114"
+ref.dir <- file.path(project.dir, "reference_files")
+```
+
+# subset DT bed for each gene list and write out
+```{r}
+dt.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38_MANE_ProteinCoding.bed")
+dn100.list <- scan(file.path(ref.dir, "top100down_genes.txt"), what = character())
+hsgenes.list <- scan(file.path(ref.dir, "highly_sensitive_genes.txt"), what = character())
+
+dn100.bed <- dt.bed[which(dt.bed$V4 %in% dn100.list), ]
+hsgenes.bed <- dt.bed[which(dt.bed$V4 %in% hsgenes.list), ]
+
+write.table(
+  dn100.bed,
+  file.path(ref.dir, "top100down_genes.bed"), 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  hsgenes.bed,
+  file.path(ref.dir, "highly_sensitive_genes.bed"), 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# submit new heatmap jobs
+```{bash}
+sbatch scripts/DTMatrix_MENIN_100down_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MLL_100down_RPGCnorm.sbatch
+
+sbatch scripts/DTMatrix_MENIN_hsGenes_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MLL_hsGenes_RPGCnorm.sbatch
+```
+
+# get diff peaks for each DRUGvDMSO comparison for both marks
+```{bash}
+mkdir bdgdiff
+dname=macs/broadpeaks
+
+# compare combo v VEH
+sbatch scripts/bdgdiff.sbatch \
+  ${dname}/Combo-Menin_S23_treat_pileup.bdg \
+  ${dname}/Combo-Menin_S23_control_lambda.bdg \
+  ${dname}/VEH-Menin_S20_treat_pileup.bdg \
+  ${dname}/VEH-Menin_S20_control_lambda.bdg \
+  COMBOvVEH_Menin
+sbatch scripts/bdgdiff.sbatch \
+  ${dname}/Combo-MLL_S18_treat_pileup.bdg \
+  ${dname}/Combo-MLL_S18_control_lambda.bdg \
+  ${dname}/VEH-MLL_S15_treat_pileup.bdg \
+  ${dname}/VEH-MLL_S15_control_lambda.bdg \
+  COMBOvVEH_MLL
+  
+# now each drug individually
+sbatch scripts/bdgdiff.sbatch \
+  ${dname}/CTX-Menin_S21_treat_pileup.bdg \
+  ${dname}/CTX-Menin_S21_control_lambda.bdg \
+  ${dname}/VEH-Menin_S20_treat_pileup.bdg \
+  ${dname}/VEH-Menin_S20_control_lambda.bdg \
+  CTXvVEH_Menin
+sbatch scripts/bdgdiff.sbatch \
+  ${dname}/CTX-MLL_S16_treat_pileup.bdg \
+  ${dname}/CTX-MLL_S16_control_lambda.bdg \
+  ${dname}/VEH-MLL_S15_treat_pileup.bdg \
+  ${dname}/VEH-MLL_S15_control_lambda.bdg \
+  CTXvVEH_MLL
+  
+sbatch scripts/bdgdiff.sbatch \
+  ${dname}/VTP-Menin_S22_treat_pileup.bdg \
+  ${dname}/VTP-Menin_S22_control_lambda.bdg \
+  ${dname}/VEH-Menin_S20_treat_pileup.bdg \
+  ${dname}/VEH-Menin_S20_control_lambda.bdg \
+  VTPvVEH_Menin
+sbatch scripts/bdgdiff.sbatch \
+  ${dname}/VTP-MLL_S17_treat_pileup.bdg \
+  ${dname}/VTP-MLL_S17_control_lambda.bdg \
+  ${dname}/VEH-MLL_S15_treat_pileup.bdg \
+  ${dname}/VEH-MLL_S15_control_lambda.bdg \
+  VTPvVEH_MLL
+```
+
+# make heatmaps for each set of diff peaks
+```{bash}
+sbatch scripts/DTMatrix_MLL_COMBO_diffPeaks_refpoint.sbatch
+sbatch scripts/DTMatrix_MENIN_COMBO_diffPeaks_refpoint.sbatch
+
+sbatch scripts/DTMatrix_MLL_CTX_diffPeaks_refpoint.sbatch
+sbatch scripts/DTMatrix_MENIN_CTX_diffPeaks_refpoint.sbatch
+
+sbatch scripts/DTMatrix_MLL_VTP_diffPeaks_refpoint.sbatch
+sbatch scripts/DTMatrix_MENIN_VTP_diffPeaks_refpoint.sbatch
+```
+
+# make DT plots (gene region, ref point, & profile plots) for new gene lists
+# first need to make GOI lists from Shez into DT bed files
+```{r}
+ensg.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38EnsGeneDT.bed")
+dn24h.list <- scan(file.path(ref.dir, "24hr_DN_genes.txt"), what = character(), skip = 1)
+dn6h.list <- scan(file.path(ref.dir, "6hr_DN_genes.txt"), what = character(), skip = 1)
+exp6h.list <- scan(file.path(ref.dir, "6hr_exp_ensg_cpm2.txt"), what = character(), skip = 1)
+
+dn24h.bed <- ensg.bed[which(ensg.bed$V5 %in% dn24h.list), ]
+dn6h.bed <- ensg.bed[which(ensg.bed$V5 %in% dn6h.list), ]
+exp6h.bed <- ensg.bed[which(ensg.bed$V5 %in% exp6h.list), ]
+
+write.table(
+  dn24h.bed,
+  file.path(ref.dir, "24hr_DN_genes.bed"), 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  dn6h.bed,
+  file.path(ref.dir, "6hr_DN_genes.bed"), 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  exp6h.bed,
+  file.path(ref.dir, "6hr_exp_ensg_cpm2.bed"), 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# submit DT scripts
+```{bash}
+sbatch scripts/DTMatrix_MLL_24hrDN_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MENIN_24hrDN_RPGCnorm.sbatch
+
+sbatch scripts/DTMatrix_MLL_6hrDN_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MENIN_6hrDN_RPGCnorm.sbatch
+
+sbatch scripts/DTMatrix_MLL_6hrEXP_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_MENIN_6hrEXP_RPGCnorm.sbatch
+
+sbatch scripts/DTMatrix_MLL_24hrDN_refpoint.sbatch
+sbatch scripts/DTMatrix_MENIN_24hrDN_refpoint.sbatch
+
+sbatch scripts/DTMatrix_MLL_6hrDN_refpoint.sbatch
+sbatch scripts/DTMatrix_MENIN_6hrDN_refpoint.sbatch
+
+sbatch scripts/DTMatrix_MLL_6hrEXP_refpoint.sbatch
+sbatch scripts/DTMatrix_MENIN_6hrEXP_refpoint.sbatch
+```
+
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_ChIPseq_250114.txt"))
+)
+```
